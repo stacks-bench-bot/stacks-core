@@ -47,6 +47,25 @@ fn sqlite_put(conn: &Connection, key: &str, value: &str) -> Result<(), VmExecuti
     }
 }
 
+fn sqlite_put_many(conn: &Connection, items: &[(String, String)]) -> Result<(), VmExecutionError> {
+    let mut stmt = conn
+        .prepare("REPLACE INTO data_table (key, value) VALUES (?, ?)")
+        .map_err(|e| {
+            error!("Failed to prepare insert/replace into data_table: {e:?}");
+            VmExecutionError::from(VmInternalError::DBError(SQL_FAIL_MESSAGE.into()))
+        })?;
+
+    for (key, value) in items {
+        let params = params![key, value];
+        if let Err(e) = stmt.execute(params) {
+            error!("Failed to insert/replace ({key},{value}): {e:?}");
+            return Err(VmInternalError::DBError(SQL_FAIL_MESSAGE.into()).into());
+        }
+    }
+
+    Ok(())
+}
+
 fn sqlite_get(conn: &Connection, key: &str) -> Result<Option<String>, VmExecutionError> {
     trace!("sqlite_get {key}");
     let params = params![key];
@@ -133,6 +152,11 @@ impl SqliteConnection {
     #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
     pub fn put(conn: &Connection, key: &str, value: &str) -> Result<(), VmExecutionError> {
         sqlite_put(conn, key, value)
+    }
+
+    #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
+    pub fn put_many(conn: &Connection, items: &[(String, String)]) -> Result<(), VmExecutionError> {
+        sqlite_put_many(conn, items)
     }
 
     #[cfg_attr(feature = "profiler", stacks_profiler::profile)]
@@ -371,10 +395,7 @@ impl ClarityBackingStore for MemoryBackingStore {
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
-        for (key, value) in items.into_iter() {
-            SqliteConnection::put(self.get_side_store(), &key, &value)?;
-        }
-        Ok(())
+        SqliteConnection::put_many(self.get_side_store(), &items)
     }
 
     fn get_contract_hash(
