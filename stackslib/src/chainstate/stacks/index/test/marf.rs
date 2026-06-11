@@ -174,6 +174,61 @@ fn marf_insert_different_leaf_different_path_different_block_100() {
 }
 
 #[test]
+fn marf_deferred_seal_postorder_hash_parity() {
+    let mut expected_root_hashes = None;
+
+    for marf_opts in opts::ALL_OPTS_NOOP.clone().into_iter() {
+        test_debug!("With {:?}", &marf_opts);
+        let f = TrieFileStorage::new_memory(marf_opts).unwrap();
+        let mut marf = MARF::from_storage(f);
+
+        let genesis_header = BlockHeaderHash([0u8; 32]);
+        marf.begin(&BlockHeaderHash::sentinel(), &genesis_header)
+            .unwrap();
+
+        for key_byte in 0..=u8::MAX {
+            let mut path_bytes = [0u8; 32];
+            path_bytes[0] = key_byte;
+            marf.insert_raw(
+                TrieHash::from_bytes(&path_bytes).unwrap(),
+                TrieLeaf::new(&[], &[key_byte; 40]),
+            )
+            .unwrap();
+        }
+        marf.commit().unwrap();
+
+        let mut parent_header = genesis_header;
+        for block_byte in 1..=4 {
+            let block_header = BlockHeaderHash([block_byte; 32]);
+            marf.begin(&parent_header, &block_header).unwrap();
+
+            for (ix, key_byte) in [0, 3, 17, 64, 128, 255].iter().enumerate() {
+                let mut path_bytes = [0u8; 32];
+                path_bytes[0] = *key_byte;
+                let value_byte = block_byte.wrapping_mul(16).wrapping_add(ix as u8);
+                marf.insert_raw(
+                    TrieHash::from_bytes(&path_bytes).unwrap(),
+                    TrieLeaf::new(&[], &[value_byte; 40]),
+                )
+                .unwrap();
+            }
+
+            marf.commit().unwrap();
+            parent_header = block_header;
+        }
+
+        let root_hashes = marf
+            .borrow_storage_backend()
+            .read_root_to_block_table()
+            .unwrap();
+        if let Some(expected_root_hashes) = expected_root_hashes.take() {
+            assert_eq!(expected_root_hashes, root_hashes);
+        }
+        expected_root_hashes = Some(root_hashes);
+    }
+}
+
+#[test]
 fn marf_insert_same_leaf_different_block_100() {
     let mut last_root_hashes = None;
     for marf_opts in opts::ALL_OPTS_NOOP.clone().into_iter() {

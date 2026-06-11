@@ -822,111 +822,149 @@ impl<T: MarfTrieId> TrieRAM<T> {
         node_ptr: u64,
     ) -> Result<TrieHash, Error> {
         let start_time = storage_tx.bench.write_children_hashes_start();
-        let mut start_node_time = Some(storage_tx.bench.write_children_hashes_same_block_start());
-        let (node, node_hash) = self.get_nodetype(node_ptr as u32)?.to_owned();
-        if node.is_leaf() {
-            // base case: we already have the hash of the leaf, so return it.
-            Ok(node_hash)
-        } else {
-            // inductive case: calculate children hashes, hash them, and return that hash.
-            let mut hasher = TrieHasher::new();
-            let empty_node_hash = TrieHash::EMPTY;
+        let root_ptr = node_ptr as u32;
+        let mut stack = vec![(root_ptr, false)];
+        let mut postorder = Vec::new();
 
-            node.write_consensus_bytes(storage_tx, &mut hasher)
-                .expect("IO Failure pushing to hasher.");
+        while let Some((ptr, visited)) = stack.pop() {
+            let (node, _) = self.get_nodetype(ptr)?;
+            if visited || node.is_leaf() {
+                postorder.push(ptr);
+                continue;
+            }
 
-            // count get_nodetype load time for write_children_hashes_same_block benchmark, but
-            // only if that code path will be exercised.
-            for ptr in node.ptrs().iter() {
-                if !is_backptr(ptr.id()) && !ptr.is_empty() {
-                    if let Some(start_node_time) = start_node_time.take() {
-                        // count the time taken to load the root node in this case,
-                        // but only do so once.
+            stack.push((ptr, true));
+            for child_ptr in node.ptrs().iter().rev() {
+                if !child_ptr.is_empty() && !is_backptr(child_ptr.id()) {
+                    stack.push((child_ptr.ptr(), false));
+                }
+            }
+        }
+
+        let mut calculated_hashes = vec![None; self.data.len()];
+        let write_deferred_hashes =
+            TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode;
+
+        for ptr in postorder {
+            let calculated_hash = {
+                let (node, node_hash) = self.get_nodetype(ptr)?;
+                if node.is_leaf() {
+                    calculated_hashes
+                        .get_mut(ptr as usize)
+                        .ok_or_else(|| {
+                            Error::CorruptionError(
+                                "Miscalculated deferred trie hash pointer".into(),
+                            )
+                        })?
+                        .replace(*node_hash);
+                    continue;
+                }
+
+                // inductive case: calculate children hashes, hash them, and return that hash.
+                let mut hasher = TrieHasher::new();
+                let empty_node_hash = TrieHash::EMPTY;
+
+                node.write_consensus_bytes(storage_tx, &mut hasher)
+                    .expect("IO Failure pushing to hasher.");
+
+                // calculate the hashes of this node's children, and store them if they're in the
+                // same trie.
+                for child_ptr in node.ptrs().iter() {
+                    if child_ptr.is_empty() {
+                        // hash of empty string
+                        let start_time = storage_tx.bench.write_children_hashes_empty_start();
+
+                        hasher.write_all(empty_node_hash.as_bytes())?;
+
                         storage_tx
                             .bench
-                            .write_children_hashes_same_block_finish(start_node_time);
-                        break;
+                            .write_children_hashes_empty_finish(start_time);
+                    } else if !is_backptr(child_ptr.id()) {
+                        // hash is the hash of this node's children
+                        let node_hash = calculated_hashes
+                            .get(child_ptr.ptr() as usize)
+                            .and_then(|hash| hash.as_ref().cloned())
+                            .ok_or_else(|| {
+                                Error::CorruptionError(
+                                    "Deferred trie hash postorder missed a same-block child".into(),
+                                )
+                            })?;
+
+                        // count the time taken to store the hash towards the
+                        // write_children_hashes_same_benchmark
+                        let start_time = storage_tx.bench.write_children_hashes_same_block_start();
+                        trace!(
+                            "calculate_node_hashes({:?}): at chr {} ptr {}: {:?} {:?}",
+                            &self.block_header,
+                            child_ptr.chr(),
+                            child_ptr.ptr(),
+                            &node_hash,
+                            node
+                        );
+                        hasher.write_all(node_hash.as_bytes())?;
+
+                        storage_tx
+                            .bench
+                            .write_children_hashes_same_block_finish(start_time);
+                    } else {
+                        // hash is that of the block that contains this node
+                        let start_time = storage_tx
+                            .bench
+                            .write_children_hashes_ancestor_block_start();
+
+                        let block_hash =
+                            storage_tx.get_block_hash_caching(child_ptr.back_block())?;
+                        trace!(
+                            "calculate_node_hashes({:?}): at chr {} bkptr {}: {:?} {:?}",
+                            &self.block_header,
+                            child_ptr.chr(),
+                            child_ptr.ptr(),
+                            &block_hash,
+                            node
+                        );
+                        hasher.write_all(block_hash.as_bytes())?;
+
+                        storage_tx
+                            .bench
+                            .write_children_hashes_ancestor_block_finish(start_time);
                     }
                 }
-            }
 
-            // calculate the hashes of this node's children, and store them if they're in the
-            // same trie.
-            for ptr in node.ptrs().iter() {
-                if ptr.is_empty() {
-                    // hash of empty string
-                    let start_time = storage_tx.bench.write_children_hashes_empty_start();
-
-                    hasher.write_all(empty_node_hash.as_bytes())?;
-
+                // only measure full trie
+                if node_ptr == 0 && ptr == root_ptr {
                     storage_tx
                         .bench
-                        .write_children_hashes_empty_finish(start_time);
-                } else if !is_backptr(ptr.id()) {
-                    // hash is the hash of this node's children
-                    let node_hash = self.calculate_node_hashes(storage_tx, ptr.ptr() as u64)?;
-
-                    // count the time taken to store the hash towards the
-                    // write_children_hashes_same_benchmark
-                    let start_time = storage_tx.bench.write_children_hashes_same_block_start();
-                    trace!(
-                        "calculate_node_hashes({:?}): at chr {} ptr {}: {:?} {:?}",
-                        &self.block_header,
-                        ptr.chr(),
-                        ptr.ptr(),
-                        &node_hash,
-                        node
-                    );
-                    hasher.write_all(node_hash.as_bytes())?;
-
-                    if TrieHashCalculationMode::Deferred == storage_tx.deref().hash_calculation_mode
-                        && ptr.id() != TrieNodeID::Leaf as u8
-                    {
-                        // need to store this hash too, since we deferred calculation
-                        self.write_node_hash(ptr.ptr(), node_hash)?;
-                    }
-
-                    storage_tx
-                        .bench
-                        .write_children_hashes_same_block_finish(start_time);
-                } else {
-                    // hash is that of the block that contains this node
-                    let start_time = storage_tx
-                        .bench
-                        .write_children_hashes_ancestor_block_start();
-
-                    let block_hash = storage_tx.get_block_hash_caching(ptr.back_block())?;
-                    trace!(
-                        "calculate_node_hashes({:?}): at chr {} bkptr {}: {:?} {:?}",
-                        &self.block_header,
-                        ptr.chr(),
-                        ptr.ptr(),
-                        &block_hash,
-                        node
-                    );
-                    hasher.write_all(block_hash.as_bytes())?;
-
-                    storage_tx
-                        .bench
-                        .write_children_hashes_ancestor_block_finish(start_time);
+                        .write_children_hashes_finish(start_time, true);
                 }
-            }
 
-            // only measure full trie
-            if node_ptr == 0 {
-                storage_tx
-                    .bench
-                    .write_children_hashes_finish(start_time, true);
-            }
+                let node_hash = {
+                    let mut buf = [0u8; 32];
+                    buf.copy_from_slice(hasher.finalize().as_slice());
+                    TrieHash(buf)
+                };
 
-            let node_hash = {
-                let mut buf = [0u8; 32];
-                buf.copy_from_slice(hasher.finalize().as_slice());
-                TrieHash(buf)
+                node_hash
             };
 
-            Ok(node_hash)
+            calculated_hashes
+                .get_mut(ptr as usize)
+                .ok_or_else(|| {
+                    Error::CorruptionError("Miscalculated deferred trie hash pointer".into())
+                })?
+                .replace(calculated_hash);
+
+            if write_deferred_hashes && ptr != root_ptr {
+                // need to store this hash too, since we deferred calculation
+                self.write_node_hash(ptr, calculated_hash)?;
+            }
         }
+
+        calculated_hashes
+            .get(root_ptr as usize)
+            .and_then(|hash| hash.as_ref().cloned())
+            .ok_or_else(|| {
+                Error::CorruptionError("Deferred trie hash root was not calculated".into())
+            })
     }
 
     /// Walk through the buffered TrieNodes and dump them to f.
