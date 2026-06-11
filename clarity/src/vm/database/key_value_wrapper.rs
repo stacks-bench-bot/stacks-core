@@ -130,6 +130,10 @@ pub struct RollbackWrapper<'a> {
     //   to indicate a given contexts "start depth".
     stack: Vec<RollbackContext>,
     query_pending_data: bool,
+    active_block_hash: Option<StacksBlockId>,
+    materialized_read_cache: HashMap<StacksBlockId, HashMap<String, Option<String>>>,
+    materialized_metadata_cache:
+        HashMap<StacksBlockId, HashMap<(QualifiedContractIdentifier, String), Option<String>>>,
 }
 
 // This is used for preserving rollback data longer
@@ -210,6 +214,9 @@ impl<'a> RollbackWrapper<'a> {
             metadata_lookup_map: HashMap::new(),
             stack: Vec::new(),
             query_pending_data: true,
+            active_block_hash: None,
+            materialized_read_cache: HashMap::new(),
+            materialized_metadata_cache: HashMap::new(),
         }
     }
 
@@ -223,6 +230,9 @@ impl<'a> RollbackWrapper<'a> {
             metadata_lookup_map: log.metadata_lookup_map,
             stack: log.stack,
             query_pending_data: true,
+            active_block_hash: None,
+            materialized_read_cache: HashMap::new(),
+            materialized_metadata_cache: HashMap::new(),
         }
     }
 
@@ -287,6 +297,7 @@ impl<'a> RollbackWrapper<'a> {
                         "ERROR: Failed to commit data to sql store: {e:?}"
                     ))
                 })?;
+                self.materialized_read_cache.clear();
             }
 
             let metadata_edits = rollback_check_pre_bottom_commit(
@@ -299,6 +310,7 @@ impl<'a> RollbackWrapper<'a> {
                         "ERROR: Failed to commit data to sql store: {e:?}"
                     ))
                 })?;
+                self.materialized_metadata_cache.clear();
             }
         }
 
@@ -344,13 +356,69 @@ impl RollbackWrapper<'_> {
         bhh: StacksBlockId,
         query_pending_data: bool,
     ) -> Result<StacksBlockId, VmExecutionError> {
-        self.store.set_block_hash(bhh).inspect(|_| {
+        self.store.set_block_hash(bhh.clone()).inspect(|_| {
             // use and_then so that query_pending_data is only set once set_block_hash succeeds
             //  this doesn't matter in practice, because a set_block_hash failure always aborts
             //  the transaction with a runtime error (destroying its environment), but it's much
             //  better practice to do this, especially if the abort behavior changes in the future.
             self.query_pending_data = query_pending_data;
+            self.active_block_hash = Some(bhh);
         })
+    }
+
+    fn get_materialized_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
+        if self.query_pending_data {
+            return self.store.get_data(key);
+        }
+
+        let Some(active_block_hash) = self.active_block_hash.as_ref() else {
+            return self.store.get_data(key);
+        };
+
+        if let Some(value) = self
+            .materialized_read_cache
+            .get(active_block_hash)
+            .and_then(|block_cache| block_cache.get(key))
+        {
+            return Ok(value.clone());
+        }
+
+        let value = self.store.get_data(key)?;
+        self.materialized_read_cache
+            .entry(active_block_hash.clone())
+            .or_default()
+            .insert(key.to_string(), value.clone());
+        Ok(value)
+    }
+
+    fn get_materialized_metadata(
+        &mut self,
+        contract: &QualifiedContractIdentifier,
+        key: &str,
+    ) -> Result<Option<String>, VmExecutionError> {
+        if self.query_pending_data {
+            return self.store.get_metadata(contract, key);
+        }
+
+        let Some(active_block_hash) = self.active_block_hash.as_ref() else {
+            return self.store.get_metadata(contract, key);
+        };
+
+        let metadata_key = (contract.clone(), key.to_string());
+        if let Some(value) = self
+            .materialized_metadata_cache
+            .get(active_block_hash)
+            .and_then(|block_cache| block_cache.get(&metadata_key))
+        {
+            return Ok(value.clone());
+        }
+
+        let value = self.store.get_metadata(contract, key)?;
+        self.materialized_metadata_cache
+            .entry(active_block_hash.clone())
+            .or_default()
+            .insert(metadata_key, value.clone());
+        Ok(value)
     }
 
     /// this function will only return commitment proofs for values _already_ materialized
@@ -401,8 +469,7 @@ impl RollbackWrapper<'_> {
             return Some(T::deserialize(pending_value)).transpose();
         }
         // otherwise, lookup from store
-        self.store
-            .get_data(key)?
+        self.get_materialized_data(key)?
             .map(|x| T::deserialize(&x))
             .transpose()
     }
@@ -459,7 +526,7 @@ impl RollbackWrapper<'_> {
         {
             return Ok(Some(Self::deserialize_value(x, expected, epoch)?));
         }
-        let stored_data = self.store.get_data(key).map_err(|_| {
+        let stored_data = self.get_materialized_data(key).map_err(|_| {
             SerializationError::DeserializationFailure(
                 "ERROR: Clarity backing store failure".into(),
             )
@@ -552,7 +619,7 @@ impl RollbackWrapper<'_> {
 
         match lookup_result {
             Some(x) => Ok(Some(x)),
-            None => self.store.get_metadata(contract, key),
+            None => self.get_materialized_metadata(contract, key),
         }
     }
 
@@ -605,5 +672,358 @@ impl RollbackWrapper<'_> {
         key: &str,
     ) -> bool {
         matches!(self.get_metadata(contract, key), Ok(Some(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use stacks_common::types::StacksEpochId;
+    use stacks_common::types::chainstate::{StacksBlockId, TrieHash};
+    use stacks_common::util::hash::{Sha512Trunc256Sum, to_hex};
+
+    use super::RollbackWrapper;
+    use crate::vm::Value;
+    use crate::vm::database::ClarityBackingStore;
+    use crate::vm::errors::VmExecutionError;
+    use crate::vm::types::{QualifiedContractIdentifier, TypeSignature};
+
+    struct CountingBackingStore {
+        active_block_hash: StacksBlockId,
+        data: HashMap<StacksBlockId, HashMap<String, String>>,
+        metadata: HashMap<StacksBlockId, HashMap<(QualifiedContractIdentifier, String), String>>,
+        data_reads: HashMap<(StacksBlockId, String), usize>,
+        metadata_reads: HashMap<(StacksBlockId, QualifiedContractIdentifier, String), usize>,
+    }
+
+    impl CountingBackingStore {
+        fn new(active_block_hash: StacksBlockId) -> Self {
+            Self {
+                active_block_hash,
+                data: HashMap::new(),
+                metadata: HashMap::new(),
+                data_reads: HashMap::new(),
+                metadata_reads: HashMap::new(),
+            }
+        }
+
+        fn insert_data(&mut self, block_hash: StacksBlockId, key: &str, value: &str) {
+            self.data
+                .entry(block_hash)
+                .or_default()
+                .insert(key.to_string(), value.to_string());
+        }
+
+        fn insert_metadata(
+            &mut self,
+            block_hash: StacksBlockId,
+            contract: QualifiedContractIdentifier,
+            key: &str,
+            value: &str,
+        ) {
+            self.metadata
+                .entry(block_hash)
+                .or_default()
+                .insert((contract, key.to_string()), value.to_string());
+        }
+
+        fn data_read_count(&self, block_hash: &StacksBlockId, key: &str) -> usize {
+            self.data_reads
+                .get(&(block_hash.clone(), key.to_string()))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn metadata_read_count(
+            &self,
+            block_hash: &StacksBlockId,
+            contract: &QualifiedContractIdentifier,
+            key: &str,
+        ) -> usize {
+            self.metadata_reads
+                .get(&(block_hash.clone(), contract.clone(), key.to_string()))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl ClarityBackingStore for CountingBackingStore {
+        fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
+            let data = self.data.entry(self.active_block_hash.clone()).or_default();
+            for (key, value) in items {
+                data.insert(key, value);
+            }
+            Ok(())
+        }
+
+        fn get_data(&mut self, key: &str) -> Result<Option<String>, VmExecutionError> {
+            *self
+                .data_reads
+                .entry((self.active_block_hash.clone(), key.to_string()))
+                .or_default() += 1;
+            Ok(self
+                .data
+                .get(&self.active_block_hash)
+                .and_then(|data| data.get(key).cloned()))
+        }
+
+        fn get_data_from_path(
+            &mut self,
+            _hash: &TrieHash,
+        ) -> Result<Option<String>, VmExecutionError> {
+            Ok(None)
+        }
+
+        fn get_data_with_proof(
+            &mut self,
+            key: &str,
+        ) -> Result<Option<(String, Vec<u8>)>, VmExecutionError> {
+            Ok(self.get_data(key)?.map(|value| (value, Vec::new())))
+        }
+
+        fn get_data_with_proof_from_path(
+            &mut self,
+            _hash: &TrieHash,
+        ) -> Result<Option<(String, Vec<u8>)>, VmExecutionError> {
+            Ok(None)
+        }
+
+        fn set_block_hash(
+            &mut self,
+            bhh: StacksBlockId,
+        ) -> Result<StacksBlockId, VmExecutionError> {
+            let prior = self.active_block_hash.clone();
+            self.active_block_hash = bhh;
+            Ok(prior)
+        }
+
+        fn get_block_at_height(&mut self, _height: u32) -> Option<StacksBlockId> {
+            None
+        }
+
+        fn get_current_block_height(&mut self) -> u32 {
+            0
+        }
+
+        fn get_open_chain_tip_height(&mut self) -> u32 {
+            0
+        }
+
+        fn get_open_chain_tip(&mut self) -> StacksBlockId {
+            self.active_block_hash.clone()
+        }
+
+        fn get_contract_hash(
+            &mut self,
+            _contract: &QualifiedContractIdentifier,
+        ) -> Result<(StacksBlockId, Sha512Trunc256Sum), VmExecutionError> {
+            Ok((self.active_block_hash.clone(), Sha512Trunc256Sum([0; 32])))
+        }
+
+        #[cfg(feature = "rusqlite")]
+        fn get_side_store(&mut self) -> &rusqlite::Connection {
+            panic!("CountingBackingStore does not use sqlite")
+        }
+
+        fn insert_metadata(
+            &mut self,
+            contract: &QualifiedContractIdentifier,
+            key: &str,
+            value: &str,
+        ) -> Result<(), VmExecutionError> {
+            self.metadata
+                .entry(self.active_block_hash.clone())
+                .or_default()
+                .insert((contract.clone(), key.to_string()), value.to_string());
+            Ok(())
+        }
+
+        fn get_metadata(
+            &mut self,
+            contract: &QualifiedContractIdentifier,
+            key: &str,
+        ) -> Result<Option<String>, VmExecutionError> {
+            *self
+                .metadata_reads
+                .entry((
+                    self.active_block_hash.clone(),
+                    contract.clone(),
+                    key.to_string(),
+                ))
+                .or_default() += 1;
+            Ok(self
+                .metadata
+                .get(&self.active_block_hash)
+                .and_then(|data| data.get(&(contract.clone(), key.to_string())).cloned()))
+        }
+
+        fn get_metadata_manual(
+            &mut self,
+            _at_height: u32,
+            contract: &QualifiedContractIdentifier,
+            key: &str,
+        ) -> Result<Option<String>, VmExecutionError> {
+            self.get_metadata(contract, key)
+        }
+    }
+
+    #[test]
+    fn materialized_reads_are_cached_by_block_hash() {
+        let block_a = StacksBlockId([1; 32]);
+        let block_b = StacksBlockId([2; 32]);
+        let mut store = CountingBackingStore::new(block_a.clone());
+        store.insert_data(block_a.clone(), "key", "block-a");
+        store.insert_data(block_b.clone(), "key", "block-b");
+
+        {
+            let mut wrapper = RollbackWrapper::new(&mut store);
+            wrapper.nest();
+
+            wrapper.set_block_hash(block_a.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("block-a".to_string())
+            );
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("block-a".to_string())
+            );
+
+            wrapper.set_block_hash(block_b.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("block-b".to_string())
+            );
+
+            wrapper.set_block_hash(block_a.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("block-a".to_string())
+            );
+        }
+
+        assert_eq!(store.data_read_count(&block_a, "key"), 1);
+        assert_eq!(store.data_read_count(&block_b, "key"), 1);
+    }
+
+    #[test]
+    fn materialized_read_cache_ignores_surrounding_pending_writes() {
+        let block = StacksBlockId([3; 32]);
+        let mut store = CountingBackingStore::new(block.clone());
+        store.insert_data(block.clone(), "key", "committed");
+
+        {
+            let mut wrapper = RollbackWrapper::new(&mut store);
+            wrapper.nest();
+
+            wrapper.set_block_hash(block.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("committed".to_string())
+            );
+
+            wrapper.set_block_hash(block.clone(), true).unwrap();
+            wrapper.put_data("key", "pending").unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("pending".to_string())
+            );
+
+            wrapper.set_block_hash(block.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("committed".to_string())
+            );
+
+            wrapper.set_block_hash(block.clone(), true).unwrap();
+            assert_eq!(
+                wrapper.get_data::<String>("key").unwrap(),
+                Some("pending".to_string())
+            );
+        }
+
+        assert_eq!(store.data_read_count(&block, "key"), 1);
+    }
+
+    #[test]
+    fn materialized_cache_is_used_by_value_reads() {
+        let block = StacksBlockId([4; 32]);
+        let mut store = CountingBackingStore::new(block.clone());
+        let serialized = to_hex(
+            &Value::Int(123)
+                .serialize_to_vec()
+                .expect("failed to serialize test value"),
+        );
+        store.insert_data(block.clone(), "value-key", &serialized);
+
+        {
+            let mut wrapper = RollbackWrapper::new(&mut store);
+            wrapper.nest();
+            wrapper.set_block_hash(block.clone(), false).unwrap();
+
+            let first = wrapper
+                .get_value(
+                    "value-key",
+                    &TypeSignature::IntType,
+                    &StacksEpochId::Epoch25,
+                )
+                .unwrap()
+                .unwrap();
+            let second = wrapper
+                .get_value(
+                    "value-key",
+                    &TypeSignature::IntType,
+                    &StacksEpochId::Epoch25,
+                )
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(first.value, Value::Int(123));
+            assert_eq!(second.value, Value::Int(123));
+            assert_eq!(first.serialized_byte_len, second.serialized_byte_len);
+        }
+
+        assert_eq!(store.data_read_count(&block, "value-key"), 1);
+    }
+
+    #[test]
+    fn materialized_metadata_reads_are_cached_by_block_hash() {
+        let block_a = StacksBlockId([5; 32]);
+        let block_b = StacksBlockId([6; 32]);
+        let contract = QualifiedContractIdentifier::transient();
+        let mut store = CountingBackingStore::new(block_a.clone());
+        store.insert_metadata(block_a.clone(), contract.clone(), "meta-key", "meta-a");
+        store.insert_metadata(block_b.clone(), contract.clone(), "meta-key", "meta-b");
+
+        {
+            let mut wrapper = RollbackWrapper::new(&mut store);
+            wrapper.nest();
+
+            wrapper.set_block_hash(block_a.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_metadata(&contract, "meta-key").unwrap(),
+                Some("meta-a".to_string())
+            );
+            assert_eq!(
+                wrapper.get_metadata(&contract, "meta-key").unwrap(),
+                Some("meta-a".to_string())
+            );
+
+            wrapper.set_block_hash(block_b.clone(), false).unwrap();
+            assert_eq!(
+                wrapper.get_metadata(&contract, "meta-key").unwrap(),
+                Some("meta-b".to_string())
+            );
+        }
+
+        assert_eq!(
+            store.metadata_read_count(&block_a, &contract, "meta-key"),
+            1
+        );
+        assert_eq!(
+            store.metadata_read_count(&block_b, &contract, "meta-key"),
+            1
+        );
     }
 }
