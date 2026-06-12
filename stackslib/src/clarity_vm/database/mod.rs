@@ -1270,10 +1270,7 @@ impl ClarityBackingStore for MemoryBackingStore {
     }
 
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
-        for (key, value) in items.into_iter() {
-            SqliteConnection::put(self.get_side_store(), &key, &value)?;
-        }
-        Ok(())
+        SqliteConnection::put_many(self.get_side_store(), &items)
     }
 
     fn get_contract_hash(

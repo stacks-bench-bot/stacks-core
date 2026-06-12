@@ -1034,12 +1034,14 @@ impl ClarityBackingStore for PersistentWritableMarfStore<'_> {
     fn put_all_data(&mut self, items: Vec<(String, String)>) -> Result<(), VmExecutionError> {
         let mut keys = Vec::with_capacity(items.len());
         let mut values = Vec::with_capacity(items.len());
+        let mut side_store_items = Vec::with_capacity(items.len());
         for (key, value) in items.into_iter() {
             let marf_value = MARFValue::from_value(&value);
-            SqliteConnection::put(self.marf.sqlite_tx(), &marf_value.to_hex(), &value)?;
+            side_store_items.push((marf_value.to_hex(), value));
             keys.push(key);
             values.push(marf_value);
         }
+        SqliteConnection::put_many(self.marf.sqlite_tx(), &side_store_items)?;
         self.marf
             .insert_batch(&keys, values)
             .map_err(|_| VmInternalError::Expect("ERROR: Unexpected MARF Failure".into()).into())
@@ -1281,3 +1283,58 @@ impl<'a> ClarityBackingStore for Box<dyn WritableMarfStore + 'a> {
 
 impl<'a> ClarityMarfStore for Box<dyn WritableMarfStore + 'a> {}
 impl<'a> WritableMarfStore for Box<dyn WritableMarfStore + 'a> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_put_all_data_writes_same_side_store_rows_and_marf_values() {
+        let mut marfed = MarfedKV::temporary();
+        let current = StacksBlockId::sentinel();
+        let next = StacksBlockId([1; 32]);
+
+        let original_alpha = "original alpha value".to_string();
+        let final_alpha = "final alpha value".to_string();
+        let beta = "beta value".to_string();
+        let alpha_path = TrieHash::from_key("alpha");
+
+        {
+            let mut tx = marfed.begin(&current, &next);
+            tx.put_all_data(vec![
+                ("alpha".to_string(), original_alpha.clone()),
+                ("beta".to_string(), beta.clone()),
+                ("alpha".to_string(), final_alpha.clone()),
+            ])
+            .unwrap();
+
+            assert_eq!(tx.get_data("alpha").unwrap(), Some(final_alpha.clone()));
+            assert_eq!(tx.get_data("beta").unwrap(), Some(beta.clone()));
+            assert_eq!(
+                tx.get_data_from_path(&alpha_path).unwrap(),
+                Some(final_alpha.clone())
+            );
+
+            for value in [&original_alpha, &final_alpha, &beta] {
+                let side_key = MARFValue::from_value(value).to_hex();
+                assert_eq!(
+                    SqliteConnection::get(tx.get_side_store(), &side_key).unwrap(),
+                    Some(value.clone())
+                );
+            }
+
+            tx.test_commit();
+        }
+
+        let mut read_only = marfed.begin_read_only(Some(&next));
+        assert_eq!(
+            read_only.get_data("alpha").unwrap(),
+            Some(final_alpha.clone())
+        );
+        assert_eq!(read_only.get_data("beta").unwrap(), Some(beta));
+        assert_eq!(
+            read_only.get_data_from_path(&alpha_path).unwrap(),
+            Some(final_alpha)
+        );
+    }
+}
